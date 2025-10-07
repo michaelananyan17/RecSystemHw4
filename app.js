@@ -7,7 +7,11 @@ class MovieLensApp {
         this.reverseUserMap = new Map();
         this.reverseItemMap = new Map();
         this.userTopRated = new Map();
-        this.model = null;
+        this.genreMap = new Map();
+        this.genreList = [];
+        
+        this.basicModel = null;
+        this.deepModel = null;
         
         this.config = {
             maxInteractions: 80000,
@@ -17,7 +21,8 @@ class MovieLensApp {
             learningRate: 0.001
         };
         
-        this.lossHistory = [];
+        this.basicLossHistory = [];
+        this.deepLossHistory = [];
         this.isTraining = false;
         
         this.initializeUI();
@@ -50,10 +55,18 @@ class MovieLensApp {
                 };
             });
             
-            // Load items
+            // Load items and genres
             const itemsResponse = await fetch('data/u.item');
             const itemsText = await itemsResponse.text();
             const itemsLines = itemsText.trim().split('\n');
+            
+            // Parse genre list (last 19 fields in u.item)
+            this.genreList = [
+                "Unknown", "Action", "Adventure", "Animation", "Children's", 
+                "Comedy", "Crime", "Documentary", "Drama", "Fantasy",
+                "Film-Noir", "Horror", "Musical", "Mystery", "Romance",
+                "Sci-Fi", "Thriller", "War", "Western"
+            ];
             
             itemsLines.forEach(line => {
                 const parts = line.split('|');
@@ -62,17 +75,24 @@ class MovieLensApp {
                 const yearMatch = title.match(/\((\d{4})\)$/);
                 const year = yearMatch ? parseInt(yearMatch[1]) : null;
                 
+                // Parse genre flags (last 19 fields)
+                const genreFlags = parts.slice(5, 24).map(flag => parseInt(flag));
+                
                 this.items.set(itemId, {
                     title: title.replace(/\(\d{4}\)$/, '').trim(),
-                    year: year
+                    year: year,
+                    genres: genreFlags
                 });
+                
+                // Store genre mapping for quick access
+                this.genreMap.set(itemId, genreFlags);
             });
             
             // Create mappings and find users with sufficient ratings
             this.createMappings();
             this.findQualifiedUsers();
             
-            this.updateStatus(`Loaded ${this.interactions.length} interactions and ${this.items.size} items. ${this.userTopRated.size} users have 20+ ratings.`);
+            this.updateStatus(`Loaded ${this.interactions.length} interactions and ${this.items.size} items. ${this.userTopRated.size} users have 20+ ratings. ${this.genreList.length} genres detected.`);
             
             document.getElementById('train').disabled = false;
             
@@ -133,28 +153,37 @@ class MovieLensApp {
         
         this.isTraining = true;
         document.getElementById('train').disabled = true;
-        this.lossHistory = [];
+        this.basicLossHistory = [];
+        this.deepLossHistory = [];
         
-        this.updateStatus('Initializing model...');
+        this.updateStatus('Initializing models...');
         
-        // Initialize model
-        this.model = new TwoTowerModel(
+        // Initialize both models
+        this.basicModel = new BasicTwoTowerModel(
             this.userMap.size,
             this.itemMap.size,
             this.config.embeddingDim
+        );
+        
+        this.deepModel = new DeepTwoTowerModel(
+            this.userMap.size,
+            this.itemMap.size,
+            this.config.embeddingDim,
+            this.genreList.length
         );
         
         // Prepare training data
         const userIndices = this.interactions.map(i => this.userMap.get(i.userId));
         const itemIndices = this.interactions.map(i => this.itemMap.get(i.itemId));
         
-        this.updateStatus('Starting training...');
+        this.updateStatus('Starting training for both models...');
         
-        // Training loop
+        // Training loop for both models
         const numBatches = Math.ceil(userIndices.length / this.config.batchSize);
         
         for (let epoch = 0; epoch < this.config.epochs; epoch++) {
-            let epochLoss = 0;
+            let basicEpochLoss = 0;
+            let deepEpochLoss = 0;
             
             for (let batch = 0; batch < numBatches; batch++) {
                 const start = batch * this.config.batchSize;
@@ -163,31 +192,43 @@ class MovieLensApp {
                 const batchUsers = userIndices.slice(start, end);
                 const batchItems = itemIndices.slice(start, end);
                 
-                const loss = await this.model.trainStep(batchUsers, batchItems);
-                epochLoss += loss;
+                // Get genre features for deep model
+                const batchGenreFeatures = batchItems.map(itemIdx => {
+                    const itemId = this.reverseItemMap.get(itemIdx);
+                    return this.genreMap.get(itemId) || Array(this.genreList.length).fill(0);
+                });
                 
-                this.lossHistory.push(loss);
+                // Train both models
+                const basicLoss = await this.basicModel.trainStep(batchUsers, batchItems);
+                const deepLoss = await this.deepModel.trainStep(batchUsers, batchItems, batchGenreFeatures);
+                
+                basicEpochLoss += basicLoss;
+                deepEpochLoss += deepLoss;
+                
+                this.basicLossHistory.push(basicLoss);
+                this.deepLossHistory.push(deepLoss);
                 this.updateLossChart();
                 
                 if (batch % 10 === 0) {
-                    this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs}, Batch ${batch}/${numBatches}, Loss: ${loss.toFixed(4)}`);
+                    this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs}, Batch ${batch}/${numBatches}, Basic Loss: ${basicLoss.toFixed(4)}, Deep Loss: ${deepLoss.toFixed(4)}`);
                 }
                 
                 // Allow UI to update
                 await new Promise(resolve => setTimeout(resolve, 0));
             }
             
-            epochLoss /= numBatches;
-            this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs} completed. Average loss: ${epochLoss.toFixed(4)}`);
+            basicEpochLoss /= numBatches;
+            deepEpochLoss /= numBatches;
+            this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs} completed. Basic Avg Loss: ${basicEpochLoss.toFixed(4)}, Deep Avg Loss: ${deepEpochLoss.toFixed(4)}`);
         }
         
         this.isTraining = false;
         document.getElementById('train').disabled = false;
         document.getElementById('test').disabled = false;
         
-        this.updateStatus('Training completed! Click "Test" to see recommendations.');
+        this.updateStatus('Training completed! Click "Test" to compare recommendations.');
         
-        // Visualize embeddings
+        // Visualize embeddings from basic model
         this.visualizeEmbeddings();
     }
     
@@ -197,18 +238,38 @@ class MovieLensApp {
         
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         
-        if (this.lossHistory.length === 0) return;
+        if (this.basicLossHistory.length === 0) return;
         
-        const maxLoss = Math.max(...this.lossHistory);
-        const minLoss = Math.min(...this.lossHistory);
+        const allLosses = [...this.basicLossHistory, ...this.deepLossHistory];
+        const maxLoss = Math.max(...allLosses);
+        const minLoss = Math.min(...allLosses);
         const range = maxLoss - minLoss || 1;
         
+        // Draw basic model loss
         ctx.strokeStyle = '#007acc';
         ctx.lineWidth = 2;
         ctx.beginPath();
         
-        this.lossHistory.forEach((loss, index) => {
-            const x = (index / this.lossHistory.length) * canvas.width;
+        this.basicLossHistory.forEach((loss, index) => {
+            const x = (index / this.basicLossHistory.length) * canvas.width;
+            const y = canvas.height - ((loss - minLoss) / range) * canvas.height;
+            
+            if (index === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        });
+        
+        ctx.stroke();
+        
+        // Draw deep model loss
+        ctx.strokeStyle = '#28a745';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        
+        this.deepLossHistory.forEach((loss, index) => {
+            const x = (index / this.deepLossHistory.length) * canvas.width;
             const y = canvas.height - ((loss - minLoss) / range) * canvas.height;
             
             if (index === 0) {
@@ -228,7 +289,7 @@ class MovieLensApp {
     }
     
     async visualizeEmbeddings() {
-        if (!this.model) return;
+        if (!this.basicModel) return;
         
         this.updateStatus('Computing embedding visualization...');
         
@@ -243,8 +304,8 @@ class MovieLensApp {
                 Math.floor(i * this.itemMap.size / sampleSize)
             );
             
-            // Get embeddings and compute PCA
-            const embeddingsTensor = this.model.getItemEmbeddings();
+            // Get embeddings and compute PCA from basic model
+            const embeddingsTensor = this.basicModel.getItemEmbeddings();
             const embeddings = embeddingsTensor.arraySync();
             const sampleEmbeddings = sampleIndices.map(i => embeddings[i]);
             
@@ -276,7 +337,7 @@ class MovieLensApp {
             // Add title and labels
             ctx.fillStyle = '#000';
             ctx.font = '14px Arial';
-            ctx.fillText('Item Embeddings Projection (PCA)', 10, 20);
+            ctx.fillText('Item Embeddings Projection (PCA) - Basic Model', 10, 20);
             ctx.font = '12px Arial';
             ctx.fillText(`Showing ${sampleSize} items`, 10, 40);
             
@@ -350,12 +411,12 @@ class MovieLensApp {
     }
     
     async test() {
-        if (!this.model || this.qualifiedUsers.length === 0) {
-            this.updateStatus('Model not trained or no qualified users found.');
+        if (!this.basicModel || !this.deepModel || this.qualifiedUsers.length === 0) {
+            this.updateStatus('Models not trained or no qualified users found.');
             return;
         }
         
-        this.updateStatus('Generating recommendations...');
+        this.updateStatus('Generating recommendations from both models...');
         
         try {
             // Pick random qualified user
@@ -363,43 +424,57 @@ class MovieLensApp {
             const userInteractions = this.userTopRated.get(randomUser);
             const userIndex = this.userMap.get(randomUser);
             
-            // Get user embedding
-            const userEmb = this.model.getUserEmbedding(userIndex);
+            // Get user embeddings from both models
+            const basicUserEmb = this.basicModel.getUserEmbedding(userIndex);
+            const deepUserEmb = this.deepModel.getUserEmbedding(userIndex);
             
-            // Get scores for all items
-            const allItemScores = await this.model.getScoresForAllItems(userEmb);
+            // Get scores for all items from both models
+            const basicAllItemScores = await this.basicModel.getScoresForAllItems(basicUserEmb);
+            const deepAllItemScores = await this.deepModel.getScoresForAllItems(deepUserEmb);
             
             // Filter out items the user has already rated
             const ratedItemIds = new Set(userInteractions.map(i => i.itemId));
-            const candidateScores = [];
             
-            allItemScores.forEach((score, itemIndex) => {
+            const basicCandidateScores = [];
+            const deepCandidateScores = [];
+            
+            basicAllItemScores.forEach((score, itemIndex) => {
                 const itemId = this.reverseItemMap.get(itemIndex);
                 if (!ratedItemIds.has(itemId)) {
-                    candidateScores.push({ itemId, score, itemIndex });
+                    basicCandidateScores.push({ itemId, score, itemIndex });
+                }
+            });
+            
+            deepAllItemScores.forEach((score, itemIndex) => {
+                const itemId = this.reverseItemMap.get(itemIndex);
+                if (!ratedItemIds.has(itemId)) {
+                    deepCandidateScores.push({ itemId, score, itemIndex });
                 }
             });
             
             // Sort by score descending and take top 10
-            candidateScores.sort((a, b) => b.score - a.score);
-            const topRecommendations = candidateScores.slice(0, 10);
+            basicCandidateScores.sort((a, b) => b.score - a.score);
+            deepCandidateScores.sort((a, b) => b.score - a.score);
             
-            // Display results
-            this.displayResults(randomUser, userInteractions, topRecommendations);
+            const basicTopRecommendations = basicCandidateScores.slice(0, 10);
+            const deepTopRecommendations = deepCandidateScores.slice(0, 10);
+            
+            // Display results with three-column comparison
+            this.displayResults(randomUser, userInteractions, basicTopRecommendations, deepTopRecommendations);
             
         } catch (error) {
             this.updateStatus(`Error generating recommendations: ${error.message}`);
         }
     }
     
-    displayResults(userId, userInteractions, recommendations) {
+    displayResults(userId, userInteractions, basicRecommendations, deepRecommendations) {
         const resultsDiv = document.getElementById('results');
         
         const topRated = userInteractions.slice(0, 10);
         
         let html = `
-            <h2>Recommendations for User ${userId}</h2>
-            <div class="side-by-side">
+            <h2>Recommendations Comparison for User ${userId}</h2>
+            <div class="three-columns">
                 <div>
                     <h3>Top 10 Rated Movies (Historical)</h3>
                     <table>
@@ -409,6 +484,7 @@ class MovieLensApp {
                                 <th>Movie</th>
                                 <th>Rating</th>
                                 <th>Year</th>
+                                <th>Genres</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -416,12 +492,14 @@ class MovieLensApp {
         
         topRated.forEach((interaction, index) => {
             const item = this.items.get(interaction.itemId);
+            const genres = this.getGenreNames(item.genres);
             html += `
                 <tr>
                     <td>${index + 1}</td>
                     <td>${item.title}</td>
                     <td>${interaction.rating}</td>
                     <td>${item.year || 'N/A'}</td>
+                    <td>${genres.join(', ')}</td>
                 </tr>
             `;
         });
@@ -431,7 +509,7 @@ class MovieLensApp {
                     </table>
                 </div>
                 <div>
-                    <h3>Top 10 Recommended Movies</h3>
+                    <h3>Basic Model Recommendations</h3>
                     <table>
                         <thead>
                             <tr>
@@ -439,19 +517,55 @@ class MovieLensApp {
                                 <th>Movie</th>
                                 <th>Score</th>
                                 <th>Year</th>
+                                <th>Genres</th>
                             </tr>
                         </thead>
                         <tbody>
         `;
         
-        recommendations.forEach((rec, index) => {
+        basicRecommendations.forEach((rec, index) => {
             const item = this.items.get(rec.itemId);
+            const genres = this.getGenreNames(item.genres);
             html += `
                 <tr>
                     <td>${index + 1}</td>
                     <td>${item.title}</td>
                     <td>${rec.score.toFixed(4)}</td>
                     <td>${item.year || 'N/A'}</td>
+                    <td>${genres.join(', ')}</td>
+                </tr>
+            `;
+        });
+        
+        html += `
+                        </tbody>
+                    </table>
+                </div>
+                <div>
+                    <h3>Deep Learning Model Recommendations</h3>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rank</th>
+                                <th>Movie</th>
+                                <th>Score</th>
+                                <th>Year</th>
+                                <th>Genres</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+        `;
+        
+        deepRecommendations.forEach((rec, index) => {
+            const item = this.items.get(rec.itemId);
+            const genres = this.getGenreNames(item.genres);
+            html += `
+                <tr>
+                    <td>${index + 1}</td>
+                    <td>${item.title}</td>
+                    <td>${rec.score.toFixed(4)}</td>
+                    <td>${item.year || 'N/A'}</td>
+                    <td>${genres.join(', ')}</td>
                 </tr>
             `;
         });
@@ -464,7 +578,12 @@ class MovieLensApp {
         `;
         
         resultsDiv.innerHTML = html;
-        this.updateStatus('Recommendations generated successfully!');
+        this.updateStatus('Recommendations comparison generated successfully!');
+    }
+    
+    getGenreNames(genreFlags) {
+        return genreFlags.map((flag, index) => flag === 1 ? this.genreList[index] : null)
+                        .filter(genre => genre !== null);
     }
     
     updateStatus(message) {
